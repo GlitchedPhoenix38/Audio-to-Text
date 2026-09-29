@@ -1,0 +1,9 @@
+faster-whisper>=1.1.0
+gradio>=4.44.0
+
+# NVIDIA runtime libraries (cuBLAS for CUDA 12 + cuDNN 9). ctranslate2 loads
+# libcublas.so.12 / libcudnn.so.9 by name, so install these even when the
+# system CUDA is newer (e.g. Arch's cuda 13). run.sh adds them to
+# LD_LIBRARY_PATH automatically.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

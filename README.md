@@ -1,6 +1,6 @@
-# FoziScribe Local
+# FizzScribe
 
-Independent, privacy-first local transcription workspace inspired by FoziScribe's Transcribe workflow. Built with Gradio and faster-whisper; it does not connect to FoziScribe's private backend or require a paid API.
+Independent, privacy-first local transcription workspace inspired by a polished transcription workflow. Built with Gradio and faster-whisper; it does not connect to FoziScribe's private backend or require a paid API.
 
 ## Features
 - Audio and video uploads: MP3, WAV, M4A, FLAC, OGG, WebM, MP4, MOV, MKV and more.
@@ -21,8 +21,8 @@ Tuned for RTX 4050 Laptop GPU (6 GB VRAM) and 16 GB RAM. The app tries CUDA floa
 
 ## Windows 11
 Install Python 3.11 or 3.12 (64-bit), then PowerShell:
-    git clone https://github.com/GlitchedPhoenix38/Audio-to-Text.git
-    cd Audio-to-Text
+    git clone https://github.com/GlitchedPhoenix38/FizzScribe.git
+    cd FizzScribe
     py -3.11 -m venv .venv
     .\.venv\Scripts\Activate.ps1
     python -m pip install --upgrade pip
@@ -32,8 +32,8 @@ Open http://127.0.0.1:7860.
 
 ## Arch Linux
     sudo pacman -S --needed python python-pip python-virtualenv
-    git clone https://github.com/GlitchedPhoenix38/Audio-to-Text.git
-    cd Audio-to-Text
+    git clone https://github.com/GlitchedPhoenix38/FizzScribe.git
+    cd FizzScribe
     python -m venv .venv
     source .venv/bin/activate
     python -m pip install --upgrade pip

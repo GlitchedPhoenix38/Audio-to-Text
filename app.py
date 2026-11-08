@@ -1,4 +1,4 @@
-"""FoziScribe Local: private, accuracy-first Whisper transcription."""
+"""FizzScribe: private, accuracy-first Whisper transcription."""
 from __future__ import annotations
 import json, os, re, threading, time
 from datetime import datetime
@@ -109,8 +109,8 @@ def find_text(text,query):
     return "\n".join(hits[:100]) if hits else "No matches."
 
 CSS="#hero{padding:26px;border:1px solid var(--border-color-primary);border-radius:18px;background:var(--background-fill-secondary)}#hero h1{font-size:2rem;letter-spacing:-.04em}#transcript textarea{font-size:15px!important;line-height:1.7!important}footer{display:none!important}"
-with gr.Blocks(title="FoziScribe Local",theme=gr.themes.Soft(primary_hue="indigo",neutral_hue="slate"),css=CSS) as demo:
-    gr.HTML('<div id="hero"><small>FOZISCRIBE LOCAL · PRIVATE TRANSCRIPTION</small><h1>Turn audio into words.</h1><p>Whisper AI running on your own computer. Your recordings stay local.</p></div>')
+with gr.Blocks(title="FizzScribe",theme=gr.themes.Soft(primary_hue="indigo",neutral_hue="slate"),css=CSS) as demo:
+    gr.HTML('<div id="hero"><small>FIZZSCRIBE · PRIVATE TRANSCRIPTION</small><h1>Turn audio into words.</h1><p>Whisper AI running on your own computer. Your recordings stay local.</p></div>')
     with gr.Row():
         with gr.Column(scale=5):
             gr.Markdown("### 1 · Upload recording")
@@ -149,6 +149,6 @@ with gr.Blocks(title="FoziScribe Local",theme=gr.themes.Soft(primary_hue="indigo
     search.click(find_text,[transcript,query],[matches])
 
 if __name__=="__main__":
-    print("FoziScribe Local: http://127.0.0.1:7860")
+    print("FizzScribe: http://127.0.0.1:7860")
     demo.queue(default_concurrency_limit=1,max_size=10)
     demo.launch(server_name="127.0.0.1",server_port=7860,inbrowser=True,show_error=True)

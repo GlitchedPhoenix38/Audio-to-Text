@@ -1,396 +1,154 @@
-"""FoziScribe — local, offline AI audio transcription.
-
-A Gradio web app powered by faster-whisper + CTranslate2 that transcribes audio
-files entirely on your own machine. No cloud, no API keys, no internet needed
-after the models have been downloaded once.
-
-Designed and tuned for:
-    ASUS TUF A15 (2023) · AMD Ryzen 7 7435HS · RTX 4050 Laptop (6 GB VRAM) · 16 GB RAM
-
-Modes:
-    Fast     -> "small"           (~0.5 GB VRAM @ fp16)
-    Accurate -> "large-v3-turbo"  (~2.5 GB VRAM @ fp16)  <- default
-
-Run with:
-    python app.py
-"""
-
-import threading
-import time
-import warnings
+"""FoziScribe Local: private, accuracy-first Whisper transcription."""
+from __future__ import annotations
+import json, os, re, threading, time
 from datetime import datetime
 from pathlib import Path
-
 import gradio as gr
 from faster_whisper import WhisperModel
-from faster_whisper.audio import decode_audio
+from utils import build_srt, format_duration, format_timestamp, format_speed_ratio
 
-from utils import (
-    build_srt,
-    format_duration,
-    format_segment,
-    format_speed_ratio,
-    format_timestamp,
-)
+ROOT=Path(__file__).resolve().parent
+OUT=ROOT/"output"; OUT.mkdir(exist_ok=True)
+HISTORY=OUT/"history.json"
+PRESETS={"Fast":"small","Balanced":"large-v3-turbo","Accuracy (recommended)":"large-v3"}
+MODELS=["Follow preset","large-v3","large-v3-turbo","medium","small","distil-large-v3"]
+LANGS={"Auto-detect":None,"English":"en","Hindi":"hi","Urdu":"ur","Arabic":"ar","Marathi":"mr","Bengali":"bn","Tamil":"ta","Telugu":"te","French":"fr","German":"de","Spanish":"es","Portuguese":"pt","Russian":"ru","Japanese":"ja","Korean":"ko","Chinese":"zh","Turkish":"tr","Indonesian":"id"}
+EXTS={".mp3",".wav",".m4a",".flac",".ogg",".webm",".opus",".aac",".wma",".mp4",".mkv",".mov",".m4b",".aiff",".oga"}
+CACHE={}; MODEL_LOCK=threading.Lock(); JOB_LOCK=threading.Lock()
 
-warnings.filterwarnings("ignore")
+def get_history():
+    try: return json.loads(HISTORY.read_text(encoding="utf-8"))
+    except (OSError,json.JSONDecodeError): return []
 
-# --------------------------------------------------------------------------- #
-#  Configuration
-# --------------------------------------------------------------------------- #
+def save_history(items):
+    HISTORY.write_text(json.dumps(items[-50:],ensure_ascii=False,indent=2),encoding="utf-8")
 
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+def load_model(name,progress):
+    if name in CACHE: return CACHE[name]
+    errors=[]
+    with MODEL_LOCK:
+        if name in CACHE: return CACHE[name]
+        for device,precision in [("cuda","float16"),("cuda","int8_float16"),("cuda","int8"),("cpu","int8")]:
+            try:
+                progress(.03,desc=f"Loading {name} · {device}/{precision}")
+                model=WhisperModel(name,device=device,compute_type=precision,
+                    cpu_threads=max(4,(os.cpu_count() or 8)-2) if device=="cpu" else 0,num_workers=1)
+                CACHE[name]=(model,device,precision); return CACHE[name]
+            except Exception as e: errors.append(f"{device}/{precision}: {e}")
+    raise RuntimeError("Unable to load model. "+" | ".join(errors[-2:]))
 
-# Model used per mode. "large-v3-turbo" is preferred over "large-v3" because it
-# is ~8x faster and about 1.6 GB smaller while keeping near-large-v3 accuracy,
-# so it fits comfortably in the RTX 4050's 6 GB VRAM at float16.
-MODELS = {
-    "fast": "small",          # or "distil-small.en" for English-only speed
-    "accurate": "large-v3-turbo",
-}
+def duration_of(path):
+    try:
+        import av
+        with av.open(str(path)) as c:
+            s=next((x for x in c.streams if x.type=="audio"),None)
+            if s and s.duration and s.time_base: return float(s.duration*s.time_base)
+            if c.duration: return float(c.duration/1_000_000)
+    except Exception: pass
+    return None
 
-# (device, compute_type) attempts, in order of preference. CUDA + float16 first,
-# then CUDA + int8 (if float16 runs out of VRAM), and finally CPU + int8 so the
-# app always works even without a working CUDA installation.
-DEVICE_PRECISION_PREFERENCE = [
-    ("cuda", "float16"),
-    ("cuda", "int8"),
-    ("cpu", "int8"),
-]
+def stamp(seconds):
+    ms=max(0,round(seconds*1000)); h,r=divmod(ms,3600000); m,r=divmod(r,60000); s,ms=divmod(r,1000)
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-# Audio formats accepted by the upload box (anything PyAV/ffmpeg can decode).
-SUPPORTED_EXTENSIONS = {
-    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm", ".opus", ".aac",
-    ".wma", ".mp4", ".m4b", ".aiff", ".amr", ".oga", ".wv",
-}
+def make_vtt(entries):
+    return "WEBVTT\n\n"+"\n\n".join(f"{stamp(a).replace(',', '.')} --> {stamp(b).replace(',', '.')}\n{t}" for a,b,t in entries)+"\n"
 
-# How many past transcripts to keep in the session history list.
-HISTORY_LIMIT = 10
-
-# --------------------------------------------------------------------------- #
-#  Runtime state
-# --------------------------------------------------------------------------- #
-
-MODEL_CACHE: dict[str, tuple] = {}   # model_name -> (model, device, compute_type)
-SESSION_HISTORY: list[dict] = []     # last few {label, transcript}
-TRANSCRIBE_LOCK = threading.Lock()   # serializes jobs -> protects VRAM (6 GB)
-
-
-# --------------------------------------------------------------------------- #
-#  Model loading
-# --------------------------------------------------------------------------- #
-
-def _load_model(model_name: str):
-    """Load (and cache) a faster-whisper model with automatic fallback.
-
-    Returns:
-        (model, device, compute_type)
-    """
-    if model_name in MODEL_CACHE:
-        return MODEL_CACHE[model_name]
-
-    last_error = None
-    for device, compute_type in DEVICE_PRECISION_PREFERENCE:
+def transcribe(path,preset,model_override,language,task,timestamps,word_ts,beam,vad,progress=gr.Progress()):
+    if not path: raise gr.Error("Upload an audio or video file first.")
+    p=Path(str(path))
+    if p.suffix.lower() not in EXTS: raise gr.Error("Unsupported format. Use MP3, WAV, M4A, FLAC, OGG, WebM, MP4 or MOV.")
+    model_name=PRESETS.get(preset,PRESETS["Accuracy (recommended)"])
+    if model_override!="Follow preset": model_name=model_override
+    lang=LANGS.get(language); duration=duration_of(p)
+    with JOB_LOCK:
+        try: model,device,precision=load_model(model_name,progress)
+        except Exception as e: raise gr.Error(f"Model load failed: {e}\nFirst launch needs internet to download model weights.")
+        start=time.perf_counter(); lines=[]; entries=[]
         try:
-            print(f"[info] Loading '{model_name}' on {device} ({compute_type}) ...")
-            model = WhisperModel(
-                model_name,
-                device=device,
-                compute_type=compute_type,
-                cpu_threads=8 if device == "cpu" else 0,
-                num_workers=1,
-            )
-            MODEL_CACHE[model_name] = (model, device, compute_type)
-            return MODEL_CACHE[model_name]
-        except Exception as err:  # noqa: BLE001 - we try every option before failing
-            last_error = err
-            print(f"[warn] {device}/{compute_type} failed: {err}")
-
-    raise RuntimeError(
-        "Could not load the model. Every device/precision attempt failed.\n"
-        f"Last error: {last_error}\n\n"
-        "Possible causes:\n"
-        "  * No internet on the very first run (the model must be downloaded once,\n"
-        "    afterwards it is cached locally and works fully offline).\n"
-        "  * No NVIDIA GPU or CUDA runtime detected.\n"
-        "  * Missing cuBLAS / cuDNN libraries (see README -> Troubleshooting)."
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  Core transcription
-# --------------------------------------------------------------------------- #
-
-def transcribe_audio(audio_path, mode, use_word_timestamps, progress=gr.Progress()):
-    """Transcribe an uploaded audio file and return all UI outputs.
-
-    Returns:
-        (transcript, language_label, status, txt_path, srt_path, history_dd)
-    """
-    # ---- Input validation -------------------------------------------------- #
-    if not audio_path:
-        raise gr.Error("Please upload an audio file first.")
-
-    ext = Path(str(audio_path)).suffix.lower()
-    if ext not in SUPPORTED_EXTENSIONS:
-        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        raise gr.Error(
-            f"Unsupported file type '{ext or '(none)'}'.\n"
-            f"Supported formats: {supported}"
-        )
-
-    if mode not in MODELS:
-        raise gr.Error(f"Unknown mode '{mode}'.")
-
-    model_name = MODELS[mode]
-
-    # Serialize transcription jobs so two jobs can never OOM the 6 GB GPU.
-    with TRANSCRIBE_LOCK:
-        # ---- Model loading -------------------------------------------------- #
-        progress(0.0, desc=f"Loading model '{model_name}' ...")
-        try:
-            model, device, compute_type = _load_model(model_name)
-        except RuntimeError as err:
-            raise gr.Error(str(err))
-        except Exception as err:  # noqa: BLE001
-            raise gr.Error(f"Unexpected error while loading the model:\n{err}")
-
-        # Audio duration is needed for progress tracking and the speed stat.
-        # In faster-whisper >= 1.2, decode_audio returns a float32 numpy array
-        # resampled to 16 kHz, so duration is len(samples) / sampling_rate.
-        duration = None
-        try:
-            samples = decode_audio(str(audio_path))
-            duration = len(samples) / 16_000
-        except Exception:  # noqa: BLE001 - duration is only a nicety
-            duration = None
-
-        # ---- Transcription -------------------------------------------------- #
-        started = time.perf_counter()
-        transcript_lines = []
-        srt_entries = []
-        try:
-            segments, info = model.transcribe(
-                str(audio_path),
-                beam_size=5,
-                vad_filter=True,                     # skip silence -> faster
-                language=None,                       # auto-detect
-                word_timestamps=use_word_timestamps,
-            )
-
-            for segment in segments:
-                text = format_segment(segment, use_word_timestamps)
-                if not text:
-                    continue
-
-                transcript_lines.append(f"{format_timestamp(segment.start)} {text}")
-                srt_entries.append((segment.start, segment.end, text))
-
-                # Live progress + ETA based on the fraction of audio done.
+            segments,info=model.transcribe(str(p),task="translate" if task=="Translate to English" else "transcribe",
+                language=lang,beam_size=int(beam),best_of=5,patience=1.0,condition_on_previous_text=True,
+                vad_filter=bool(vad),word_timestamps=bool(word_ts),temperature=0.0,
+                compression_ratio_threshold=2.4,log_prob_threshold=-1.0,no_speech_threshold=0.6)
+            for seg in segments:
+                text=(seg.text or "").strip()
+                if not text: continue
+                entries.append((float(seg.start),float(seg.end),text))
+                lines.append(f"[{format_timestamp(seg.start)[1:-1]}] {text}" if timestamps else text)
                 if duration:
-                    fraction = min(1.0, segment.end / max(duration, 1e-9))
-                    elapsed_so_far = time.perf_counter() - started
-                    eta = elapsed_so_far / max(fraction, 1e-9) * (1 - fraction)
-                    progress(
-                        fraction,
-                        desc=(
-                            f"Transcribing {format_timestamp(segment.end)} / "
-                            f"{format_timestamp(duration)} · ETA ~{format_duration(eta)}"
-                        ),
-                    )
-        except gr.Error:
-            raise
-        except Exception as err:  # noqa: BLE001
-            raise gr.Error(
-                "Transcription failed.\n\n"
-                f"Error: {err}\n\n"
-                "If this looks like an out-of-memory error, use Fast mode or "
-                "see the README troubleshooting section."
-            )
-        elapsed = time.perf_counter() - started
+                    frac=min(.99,max(.02,seg.end/duration)); elapsed=time.perf_counter()-start
+                    progress(frac,desc=f"Transcribing {format_timestamp(seg.end)} · ETA {format_duration(elapsed/frac*(1-frac))}")
+        except Exception as e: raise gr.Error(f"Transcription failed: {e}\nTry Balanced mode if GPU memory is limited.")
+        elapsed=time.perf_counter()-start
+    transcript="\n".join(lines) or "No speech detected."
+    detected=getattr(info,"language","unknown"); prob=getattr(info,"language_probability",None)
+    language_text=detected.upper()+(f" · detection probability {prob:.0%}" if prob is not None else "")
+    tag=datetime.now().strftime("%Y%m%d-%H%M%S"); base=re.sub(r"[^A-Za-z0-9_-]+","_",p.stem)[:40] or "transcript"
+    txt=OUT/f"{base}-{tag}.txt"; srt=OUT/f"{base}-{tag}.srt"; vtt=OUT/f"{base}-{tag}.vtt"
+    txt.write_text(transcript,encoding="utf-8"); srt.write_text(build_srt(entries),encoding="utf-8"); vtt.write_text(make_vtt(entries),encoding="utf-8")
+    hist=get_history(); hist.append({"created":datetime.now().isoformat(timespec="seconds"),"name":p.name,"model":model_name,"language":detected,"transcript":transcript,"txt":str(txt),"srt":str(srt),"vtt":str(vtt)}); save_history(hist)
+    status=f"MODEL     {model_name}\nDEVICE    {device.upper()} · {precision}\nLANGUAGE  {language_text}\nDURATION  {format_timestamp(duration) if duration else 'unknown'}\nTIME      {format_duration(elapsed)}\nSPEED     {format_speed_ratio(duration,elapsed)}\nSEGMENTS  {len(entries)}"
+    choices=[f"{x['created']} · {x['name']}" for x in reversed(hist[-50:])]
+    progress(1,desc="Transcript ready")
+    return transcript,language_text,status,str(txt),str(srt),str(vtt),gr.update(choices=choices,value=choices[0] if choices else None)
 
-    # ---- Assemble results --------------------------------------------------- #
-    transcript = "\n".join(transcript_lines)
-    if not transcript:
-        transcript = "No speech detected in the audio file."
+def restore(choice):
+    for x in reversed(get_history()):
+        if f"{x['created']} · {x['name']} " .strip()==choice:
+            return x["transcript"],x["language"].upper(),f"MODEL {x['model']}\nSAVED {x['created']}",x["txt"],x["srt"],x["vtt"]
+    return "","","",None,None,None
 
-    language = getattr(info, "language", "unknown")
-    language_prob = getattr(info, "language_probability", None)
-    language_label = (
-        f"{language} (probability: {language_prob:.1%})"
-        if language_prob is not None
-        else str(language)
-    )
+def save_edited(text):
+    if not text.strip(): raise gr.Error("Transcript is empty.")
+    p=OUT/f"edited-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"; p.write_text(text,encoding="utf-8")
+    return str(p),f"Saved {p.name}"
 
-    engine = "GPU (CUDA)" if device == "cuda" else "CPU"
-    status_lines = [
-        f"Model:        {model_name}",
-        f"Engine:       {engine} · {compute_type}",
-        f"Language:     {language_label}",
-        f"Audio length: {format_timestamp(duration) if duration else 'unknown'}",
-        f"Processed in: {format_duration(elapsed)}",
-        f"Speed:        {format_speed_ratio(duration, elapsed)}",
-    ]
-    status = "\n".join(status_lines)
+def find_text(text,query):
+    if not query.strip(): return "Enter a search term."
+    hits=[x for x in text.splitlines() if query.casefold() in x.casefold()]
+    return "\n".join(hits[:100]) if hits else "No matches."
 
-    # ---- Write download files ------------------------------------------------ #
-    base_name = (Path(str(audio_path)).stem or "transcript")[:40]
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    txt_path = OUTPUT_DIR / f"{base_name}_{stamp}.txt"
-    srt_path = OUTPUT_DIR / f"{base_name}_{stamp}.srt"
-    txt_path.write_text(transcript, encoding="utf-8")
-    srt_path.write_text(build_srt(srt_entries), encoding="utf-8")
-
-    # ---- Session history ------------------------------------------------------ #
-    SESSION_HISTORY.append({
-        "label": f"{stamp} · {mode} · {language}",
-        "transcript": transcript,
-    })
-    SESSION_HISTORY[:] = SESSION_HISTORY[-HISTORY_LIMIT:]
-    history_choices = [entry["label"] for entry in SESSION_HISTORY]
-
-    return (
-        transcript,
-        language_label,
-        status,
-        str(txt_path),
-        str(srt_path),
-        gr.Dropdown(choices=history_choices, value=history_choices[-1]),
-    )
-
-
-def load_history(label):
-    """Restore a transcript from session history into the main text box."""
-    if not label:
-        return ""
-    for entry in reversed(SESSION_HISTORY):
-        if entry["label"] == label:
-            return entry["transcript"]
-    return ""
-
-
-def clear_all():
-    """Reset the UI back to a blank state (history is kept)."""
-    history_choices = [entry["label"] for entry in SESSION_HISTORY]
-    return (
-        None,   # audio
-        "",     # transcript
-        "",     # language
-        "",     # status
-        None,   # .txt download
-        None,   # .srt download
-        gr.Dropdown(choices=history_choices),
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  UI
-# --------------------------------------------------------------------------- #
-
-THEME = gr.themes.Base(
-    primary_hue="indigo",
-    secondary_hue="slate",
-    neutral_hue="gray",
-    font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
-)
-
-with gr.Blocks(
-    title="FoziScribe — Offline AI Transcription",
-    theme=THEME,
-    css="footer {display: none !important;}",
-) as demo:
-    gr.Markdown(
-        "# FoziScribe\n"
-        "### Fully offline AI audio transcription powered by faster-whisper — "
-        "runs 100% on your laptop (no cloud, no API keys)."
-    )
-
+CSS="#hero{padding:26px;border:1px solid var(--border-color-primary);border-radius:18px;background:var(--background-fill-secondary)}#hero h1{font-size:2rem;letter-spacing:-.04em}#transcript textarea{font-size:15px!important;line-height:1.7!important}footer{display:none!important}"
+with gr.Blocks(title="FoziScribe Local",theme=gr.themes.Soft(primary_hue="indigo",neutral_hue="slate"),css=CSS) as demo:
+    gr.HTML('<div id="hero"><small>FOZISCRIBE LOCAL · PRIVATE TRANSCRIPTION</small><h1>Turn audio into words.</h1><p>Whisper AI running on your own computer. Your recordings stay local.</p></div>')
     with gr.Row():
-        with gr.Column(scale=1):
-            audio_input = gr.Audio(
-                label="Audio file (drag & drop or click)",
-                type="filepath",
-                sources=["upload"],
-            )
-            mode_radio = gr.Radio(
-                choices=[
-                    ("Fast — 'small' model (fastest)", "fast"),
-                    ("Accurate — 'large-v3-turbo' (best quality)", "accurate"),
-                ],
-                value="accurate",
-                label="Mode",
-                info="Accurate uses large-v3-turbo (~2.5 GB VRAM @ fp16) — fits your RTX 4050.",
-            )
-            word_ts_check = gr.Checkbox(
-                label="Word-level timestamps",
-                value=False,
-                info="Add a timestamp after each individual word.",
-            )
-            transcribe_btn = gr.Button("Transcribe", variant="primary")
-            clear_btn = gr.Button("Clear", variant="secondary")
-
-            status_box = gr.Textbox(
-                label="Status",
-                lines=7,
-                interactive=False,
-            )
-
+        with gr.Column(scale=5):
+            gr.Markdown("### 1 · Upload recording")
+            upload=gr.File(label="Drop audio or video here",file_count="single",type="filepath",file_types=[".mp3",".wav",".m4a",".flac",".ogg",".webm",".opus",".aac",".mp4",".mkv",".mov"])
+            gr.Markdown("### 2 · Transcription settings")
+            preset=gr.Radio(["Fast","Balanced","Accuracy (recommended)"],value="Accuracy (recommended)",label="Mode",info="Accuracy: full large-v3 · Balanced: large-v3-turbo · Fast: small")
+            model=gr.Dropdown(MODELS,value="Follow preset",label="Model override")
+            language=gr.Dropdown(list(LANGS),value="Auto-detect",label="Audio language")
+            task=gr.Radio(["Transcribe in original language","Translate to English"],value="Transcribe in original language",label="Output")
+            with gr.Accordion("Advanced accuracy settings",open=False):
+                timestamps=gr.Checkbox(value=True,label="Segment timestamps")
+                word_ts=gr.Checkbox(value=False,label="Word-level timestamps")
+                beam=gr.Slider(1,10,value=5,step=1,label="Beam size")
+                vad=gr.Checkbox(value=False,label="Voice activity detection (VAD)",info="Leave off if quiet speech matters.")
+            run=gr.Button("Transcribe recording",variant="primary",size="lg")
+            status=gr.Textbox(label="Job details",lines=7,interactive=False)
+        with gr.Column(scale=7):
+            gr.Markdown("### 3 · Transcript")
+            detected=gr.Textbox(label="Detected language",interactive=False)
+            transcript=gr.Textbox(label="Transcript · editable",lines=20,interactive=True,elem_id="transcript")
             with gr.Row():
-                txt_btn = gr.DownloadButton(label="Download .txt", variant="secondary")
-                srt_btn = gr.DownloadButton(label="Download .srt", variant="secondary")
+                txt=gr.File(label="TXT"); srt=gr.File(label="SRT"); vtt=gr.File(label="WebVTT")
+            with gr.Row():
+                save=gr.Button("Save edited transcript"); edited=gr.File(label="Edited TXT")
+            save_info=gr.Markdown()
+    history=gr.Dropdown(label="Local transcript history",choices=[f"{x['created']} · {x['name']}" for x in reversed(get_history())])
+    restore_btn=gr.Button("Open selected transcript")
+    with gr.Accordion("Search inside transcript",open=False):
+        with gr.Row():
+            query=gr.Textbox(label="Search phrase"); search=gr.Button("Find")
+        matches=gr.Textbox(label="Matching lines",lines=5,interactive=False)
+    gr.Markdown("Audio is processed on this computer. Transcripts and exports are saved in output/. No account, API key, subscription or cloud transcription service is used.")
+    run.click(transcribe,[upload,preset,model,language,task,timestamps,word_ts,beam,vad],[transcript,detected,status,txt,srt,vtt,history])
+    restore_btn.click(restore,[history],[transcript,detected,status,txt,srt,vtt])
+    save.click(save_edited,[transcript],[edited,save_info])
+    search.click(find_text,[transcript,query],[matches])
 
-            history_dd = gr.Dropdown(
-                label=f"Session history (last {HISTORY_LIMIT} transcripts)",
-                choices=[],
-                interactive=True,
-            )
-            history_btn = gr.Button("Load selected transcript")
-
-        with gr.Column(scale=1):
-            language_box = gr.Textbox(label="Detected language", interactive=False)
-            transcript_box = gr.Textbox(
-                label="Transcript",
-                lines=22,
-                interactive=False,
-            )
-
-    transcribe_btn.click(
-        fn=transcribe_audio,
-        inputs=[audio_input, mode_radio, word_ts_check],
-        outputs=[
-            transcript_box, language_box, status_box,
-            txt_btn, srt_btn, history_dd,
-        ],
-    )
-
-    clear_btn.click(
-        fn=clear_all,
-        inputs=[],
-        outputs=[
-            audio_input, transcript_box, language_box, status_box,
-            txt_btn, srt_btn, history_dd,
-        ],
-    )
-
-    history_btn.click(
-        fn=load_history,
-        inputs=[history_dd],
-        outputs=[transcript_box],
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  Entry point
-# --------------------------------------------------------------------------- #
-
-if __name__ == "__main__":
-    print("Starting FoziScribe ...")
-    print(f"Transcriptions will be saved to: {OUTPUT_DIR}")
-    demo.queue()
-    demo.launch(
-        inbrowser=True,          # auto-open the browser
-        server_name="127.0.0.1",
-        server_port=7860,
-    )
+if __name__=="__main__":
+    print("FoziScribe Local: http://127.0.0.1:7860")
+    demo.queue(default_concurrency_limit=1,max_size=10)
+    demo.launch(server_name="127.0.0.1",server_port=7860,inbrowser=True,show_error=True)
